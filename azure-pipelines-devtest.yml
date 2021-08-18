@@ -27,10 +27,10 @@ pool: Default
 resources:
   repositories:
   # Azure DevOps repository
-  - repository: hauki-pipelines
+  - repository: multiple-django-test2-pipelines
     type: git
     # project/repository
-    name: hauki/hauki-pipelines
+    name: multiple-django-test2/multiple-django-test2-pipelines
 
 extends:
-  template: azure-pipelines-hauki-api-master.yml@hauki-pipelines
+  template: azure-pipelines-cron-test-devtest.yml@multiple-django-test2-pipelines
