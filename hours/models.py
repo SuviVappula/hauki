@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 import datetime
+import itertools
+import re
 from calendar import Calendar, monthrange
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import dataclass, field
+from hashlib import md5
 from itertools import chain
+from operator import attrgetter
 from typing import List, Optional, Set, Union
 
 from dateutil.relativedelta import SU, relativedelta
 from django.conf import settings
+from django.contrib.humanize.templatetags.humanize import ordinal
 from django.contrib.postgres.fields import ArrayField
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.utils import formats, translation
 from django.utils.translation import gettext_lazy as _
+from django.utils.translation import pgettext
 from django_orghierarchy.models import Organization
 from enumfields import EnumField, EnumIntegerField
 from model_utils.models import SoftDeletableModel, TimeStampedModel
@@ -300,6 +308,9 @@ class Resource(SoftDeletableModel, TimeStampedModel):
     timezone = TimeZoneField(
         default=get_resource_default_timezone, null=True, blank=True
     )
+    # Denormalized values from the date periods
+    date_periods_hash = models.CharField(max_length=64, null=True, blank=True)
+    date_periods_as_text = models.TextField(null=True, blank=True)
     # Denormalized values from the parent resources
     ancestry_is_public = models.BooleanField(null=True, blank=True)
     ancestry_data_source = ArrayField(
@@ -328,6 +339,46 @@ class Resource(SoftDeletableModel, TimeStampedModel):
     @_history_user.setter
     def _history_user(self, value):
         self.last_modified_by = value
+
+    def _get_date_periods_as_hash(self):
+        date_period_hash_inputs = [
+            date_period.as_hash_input()
+            for date_period in self.date_periods.all().prefetch_related(
+                "time_span_groups",
+                "time_span_groups__time_spans",
+                "time_span_groups__rules",
+            )
+            if not date_period.is_removed
+        ]
+        date_period_hash_inputs.sort()
+
+        return md5("".join(date_period_hash_inputs).encode("utf8")).hexdigest()  # nosec
+
+    def _get_date_periods_as_text(self):
+        date_periods = [
+            date_period
+            for date_period in self.date_periods.all().prefetch_related(
+                "time_span_groups",
+                "time_span_groups__time_spans",
+                "time_span_groups__rules",
+            )
+            if not date_period.is_removed
+        ]
+
+        if not date_periods:
+            return ""
+
+        separator = pgettext(
+            "periods_as_text_separator", "\n========================================\n"
+        )
+        date_periods = separator.join(
+            [date_period.as_text() for date_period in date_periods]
+        )
+
+        return _("{separator}{date_periods}{separator}").format(
+            date_periods=date_periods,
+            separator=separator,
+        )
 
     def get_daily_opening_hours(self, start_date, end_date):
         # TODO: This is just an MVP. Things yet to do:
@@ -423,6 +474,17 @@ class Resource(SoftDeletableModel, TimeStampedModel):
         self.ancestry_organization = list(data["organizations"])
         self.save(update_child_ancestry_fields=update_child_ancestry_fields)
 
+    def update_denormalized_date_periods_data(self):
+        self.date_periods_hash = self._get_date_periods_as_hash()
+        # TODO: Save text in all languages
+        with translation.override("fi"):
+            self.date_periods_as_text = self._get_date_periods_as_text()
+
+        self.save(
+            update_fields=["date_periods_hash", "date_periods_as_text"],
+            update_child_ancestry_fields=False,
+        )
+
     def save(
         self,
         force_insert=False,
@@ -477,6 +539,50 @@ class Resource(SoftDeletableModel, TimeStampedModel):
             child.get_descendants(acc)
 
         return acc
+
+    def copy_all_periods_to_resource(self, target_resource, replace=False):
+        if (
+            not target_resource
+            or not isinstance(target_resource, Resource)
+            or self.id == target_resource.id
+        ):
+            return
+
+        existing_period_ids = []
+        if replace:
+            existing_period_ids = list(
+                target_resource.date_periods.all().values_list("id", flat=True)
+            )
+
+        def copy_instance(instance, foreign_field_name=None, foreign_instance=None):
+            new_instance = deepcopy(instance)
+            new_instance.id = None
+            if foreign_field_name and foreign_instance:
+                setattr(new_instance, foreign_field_name, foreign_instance)
+            new_instance.save()
+
+            return new_instance
+
+        for period in self.date_periods.all():
+            new_period = copy_instance(period, "resource", target_resource)
+
+            for time_span_group in period.time_span_groups.all():
+                new_time_span_group = copy_instance(
+                    time_span_group, "period", new_period
+                )
+
+                for time_span in time_span_group.time_spans.all():
+                    copy_instance(time_span, "group", new_time_span_group)
+
+                for rule in time_span_group.rules.all():
+                    copy_instance(rule, "group", new_time_span_group)
+
+        if replace:
+            # Mark target's old periods deleted
+            for period in target_resource.date_periods.filter(
+                id__in=existing_period_ids
+            ):
+                period.delete()
 
 
 class ResourceOrigin(models.Model):
@@ -536,6 +642,66 @@ class DatePeriod(SoftDeletableModel, TimeStampedModel):
 
     def __str__(self):
         return f"{self.name}({self.start_date} - {self.end_date} {self.resource_state})"
+
+    def as_hash_input(self) -> str:
+        data = "[DATE_PERIOD:{}]".format(
+            "|".join(
+                [
+                    self.start_date.isoformat() if self.start_date else "*",
+                    self.end_date.isoformat() if self.end_date else "*",
+                    str(self.resource_state.value),
+                    str(self.override),
+                ]
+            )
+        )
+
+        group_strings = []
+        for time_span_group in self.time_span_groups.all():
+            if time_span_group.is_removed:
+                continue
+            group_strings.append(time_span_group.as_hash_input())
+        group_strings.sort()
+
+        return data + "".join(group_strings)
+
+    def as_text(self) -> str:
+        group_strings = []
+        for time_span_group in self.time_span_groups.all():
+            if time_span_group.is_removed:
+                continue
+            group_strings.append(time_span_group.as_text())
+
+        if not group_strings and self.resource_state != State.UNDEFINED:
+            group_strings = [" " + str(self.resource_state)]
+
+        time_span_groups = _("\n\n ---------------------------------------\n\n").join(
+            group_strings
+        )
+
+        dates = _("Not specified")
+        if self.start_date or self.end_date:
+            if self.start_date == self.end_date:
+                dates = formats.date_format(self.start_date)
+            else:
+                dates = "{start_date} - {end_date}".format(
+                    start_date=formats.date_format(self.start_date)
+                    if self.start_date
+                    else "",
+                    end_date=formats.date_format(self.end_date)
+                    if self.end_date
+                    else "",
+                )
+
+        return _(
+            "{name}{description}Date period: {dates}\n"
+            "Opening hours:\n\n"
+            "{time_span_groups}\n"
+        ).format(
+            name=self.name + "\n" if self.name else "",
+            description=self.description + "\n" if self.description else "",
+            dates=dates,
+            time_span_groups=time_span_groups,
+        )
 
     def get_daily_opening_hours(self, start_date, end_date):
         overlap = get_range_overlap(
@@ -646,6 +812,44 @@ class TimeSpanGroup(SoftDeletableModel, models.Model):
     def __str__(self):
         return f"{self.period} time spans {self.time_spans.all()}"
 
+    def as_hash_input(self) -> str:
+        time_span_strings = []
+        for time_span in self.time_spans.all():
+            if time_span.is_removed:
+                continue
+            time_span_strings.append(time_span.as_hash_input())
+        time_span_strings.sort()
+
+        rule_strings = []
+        for rule in self.rules.all():
+            if rule.is_removed:
+                continue
+            rule_strings.append(rule.as_hash_input())
+        rule_strings.sort()
+
+        return "".join(time_span_strings + rule_strings)
+
+    def as_text(self) -> str:
+        rule_strings = []
+        for rule in self.rules.all():
+            if rule.is_removed:
+                continue
+            rule_strings.append(" - " + rule.as_text())
+
+        time_span_strings = []
+        for time_span in self.time_spans.all():
+            if time_span.is_removed:
+                continue
+            time_span_strings.append(" " + time_span.as_text())
+
+        result = "\n".join(time_span_strings)
+        if rule_strings:
+            result += _("\n\n In effect when every one of these match:\n") + "\n".join(
+                rule_strings
+            )
+
+        return result
+
 
 class TimeSpan(SoftDeletableModel, TimeStampedModel):
     group = models.ForeignKey(
@@ -700,6 +904,69 @@ class TimeSpan(SoftDeletableModel, TimeStampedModel):
 
         return f"{self.name}({self.start_time} - {self.end_time} {weekdays})"
 
+    def as_hash_input(self) -> str:
+        sorted_weekdays = []
+        if self.weekdays:
+            sorted_weekdays = sorted(self.weekdays, key=attrgetter("value"))
+
+        return "[TIME_SPAN:{}]".format(
+            "|".join(
+                [
+                    self.start_time.isoformat() if self.start_time else "*",
+                    self.end_time.isoformat() if self.end_time else "*",
+                    str(self.end_time_on_next_day),
+                    str(self.full_day),
+                    "".join([str(i.value) for i in sorted_weekdays])
+                    if self.weekdays
+                    else "*",
+                    str(self.resource_state.value),
+                ]
+            )
+        )
+
+    def get_weekdays_as_text(self) -> str:
+        if not self.weekdays:
+            return pgettext("timespan_as_text", "Every day")
+
+        sorted_weekdays = sorted(self.weekdays, key=attrgetter("value"))
+
+        weekday_strings = []
+        for k, group in itertools.groupby(
+            sorted_weekdays, lambda w, c=itertools.count(): w.value - next(c)
+        ):
+            consecutive_weekdays = list(group)
+            if len(consecutive_weekdays) > 1:
+                weekday_strings.append(
+                    str(consecutive_weekdays[0]) + "-" + str(consecutive_weekdays[-1])
+                )
+            else:
+                weekday_strings.append(str(consecutive_weekdays[0]))
+
+        weekdays_text = ", ".join(weekday_strings)
+
+        return weekdays_text
+
+    def as_text(self) -> str:
+        if self.resource_state == State.UNDEFINED:
+            state = self.group.period.resource_state.label
+        else:
+            state = self.resource_state.label
+
+        if self.full_day:
+            times = pgettext("timespan_as_text", "The whole day")
+        else:
+            times = pgettext("timespan_as_text", "{start_time}-{end_time}").format(
+                start_time=formats.time_format(self.start_time)
+                if self.start_time
+                else "",
+                end_time=formats.time_format(self.end_time) if self.end_time else "",
+            )
+        return pgettext("timespan_as_text", "{weekdays} {times} {state}").format(
+            state=state,
+            weekdays=self.get_weekdays_as_text(),
+            times=times,
+        )
+
 
 class Rule(SoftDeletableModel, TimeStampedModel):
     group = models.ForeignKey(
@@ -743,6 +1010,74 @@ class Rule(SoftDeletableModel, TimeStampedModel):
                 f"every {self.frequency_ordinal} {self.subject}s in "
                 f"{self.context}, starting from {self.start}"
             )
+
+    def as_hash_input(self) -> str:
+        return "[RULE:{}]".format(
+            "|".join(
+                [
+                    self.context.value if self.context else "*",
+                    self.subject.value if self.subject else "*",
+                    str(self.start) if self.start is not None else "*",
+                    str(self.frequency_ordinal)
+                    if self.frequency_ordinal is not None
+                    else "*",
+                    self.frequency_modifier.value
+                    if self.frequency_modifier is not None
+                    else "*",
+                ]
+            )
+        )
+
+    def as_text(self) -> str:
+        if self.context == RuleContext.PERIOD:
+            context_text = pgettext("rule_as_text_context", "the period")
+        else:
+            context_text = pgettext("rule_as_text_context", "every {context}").format(
+                context=pgettext("every_rulecontext", self.context.value)
+            )
+
+        text = ""
+        if self.start and not self.frequency_ordinal and not self.frequency_modifier:
+            text = pgettext("rule_as_text", "{nth} {subject} in {context}").format(
+                nth=ordinal(self.start),
+                subject=self.subject.label.lower(),
+                context=context_text,
+            )
+        elif self.frequency_ordinal:
+            starting_from_text = ""
+            if self.start is not None and self.start != 1:
+                starting_from_text = pgettext(
+                    "rule_as_text", "starting from the {nth} {last} {subject}"
+                ).format(
+                    nth=ordinal(abs(self.start)) if self.start != -1 else "",
+                    last=pgettext("starting_from_the_last", "last")
+                    if self.start < 0
+                    else "",
+                    subject=pgettext(
+                        "starting_from_nth_rulesubject", self.subject.value
+                    ),
+                )
+
+            text = pgettext(
+                "rule_as_text",
+                "Every {nth} {subject} in {context} {starting_from_text}",
+            ).format(
+                nth=ordinal(self.frequency_ordinal)
+                if self.frequency_ordinal != 1
+                else "",
+                subject=self.subject.label.lower(),
+                context=context_text,
+                starting_from_text=starting_from_text,
+            )
+        elif self.frequency_modifier:
+            text = pgettext(
+                "rule_as_text", "On {modifier} {subject}s in {context}"
+            ).format(
+                modifier=self.frequency_modifier.label.lower(),
+                subject=self.subject.label.lower(),
+                context=context_text,
+            )
+        return re.sub(r"\s{2,}", " ", text.rstrip())
 
     def save(self, *args, **kwargs):
         # Note that save is not called if rules are created in the database with bulk

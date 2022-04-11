@@ -9,6 +9,7 @@ from dateutil.relativedelta import relativedelta
 from django import db
 from django.db.models import Q
 from django.utils import timezone
+from requests import RequestException
 
 from ..enums import RuleContext, RuleSubject, State, Weekday
 from ..models import (
@@ -18,6 +19,7 @@ from ..models import (
     TimeElement,
     combine_element_time_spans,
 )
+from ..signals import DeferUpdatingDenormalizedDatePeriodData
 from .base import Importer, register_importer
 from .sync import ModelSyncher
 
@@ -131,10 +133,17 @@ class KirjastotImporter(Importer):
             "period.start": start,
             "period.end": end,
         }
-        data = self.api_get("library", kirkanta_id, params)
-
-        if data["total"] > 0:
-            return data
+        try:
+            data = self.api_get("library", kirkanta_id, params)
+            if data["total"] > 0:
+                return data
+        except RequestException as e:
+            self.logger.warning(
+                "Could not fetch data from the kirjastot.fi API"
+                " for library {}:{}. Error: {}".format(
+                    self.data_source.id, kirkanta_id, str(e)
+                )
+            )
 
         return {}
 
@@ -584,8 +593,7 @@ class KirjastotImporter(Importer):
                     + f"{opening_hours[schedule_date]} vs. {time_elements}"
                 )
 
-    @db.transaction.atomic
-    def import_openings(self):
+    def do_import(self):
         libraries = Resource.objects.filter(origins__data_source=self.data_source)
 
         if self.options.get("single", None):
@@ -718,6 +726,11 @@ class KirjastotImporter(Importer):
                     library, library._kirkanta_data, import_start_date, import_end_date
                 )
                 self.logger.info("Check OK.")
+
+    @db.transaction.atomic
+    def import_openings(self):
+        with DeferUpdatingDenormalizedDatePeriodData():
+            self.do_import()
 
     def import_check(self):
         libraries = Resource.objects.filter(origins__data_source=self.data_source)

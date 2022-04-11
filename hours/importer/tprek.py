@@ -4,6 +4,7 @@ from calendar import day_abbr, different_locale, month_name
 from datetime import date
 from datetime import time as datetime_time
 from itertools import zip_longest
+from pathlib import Path
 from typing import Hashable, Tuple
 
 import pytz
@@ -15,7 +16,11 @@ from model_utils.models import SoftDeletableModel
 
 from ..enums import ResourceType, State, Weekday
 from ..models import DataSource, DatePeriod, Resource
-from ..signals import resource_children_changed, resource_children_cleared
+from ..signals import (
+    DeferUpdatingDenormalizedDatePeriodData,
+    resource_children_changed,
+    resource_children_cleared,
+)
 from .base import Importer, register_importer
 from .sync import ModelSyncher
 
@@ -29,12 +34,24 @@ CONNECTION_TYPE_MAPPING = {
     "TOPICAL": ResourceType.SUBSECTION,
     "HIGHLIGHT": ResourceType.SUBSECTION,
     "OTHER_INFO": ResourceType.SUBSECTION,
+    "PRICE": ResourceType.SUBSECTION,
 }
 
 # here we list the tprek connection types that we do *not* want to import as resources
-CONNECTION_TYPES_TO_IGNORE = {"OPENING_HOURS", "SOCIAL_MEDIA_LINK"}
+CONNECTION_TYPES_TO_IGNORE = {
+    "OPENING_HOURS",
+    "SOCIAL_MEDIA_LINK",
+}
 # here we list the tprek connection types that should *not* be parsed for opening hours
-CONNECTION_TYPES_TO_SKIP_HOURS = {"HIGHLIGHT", "OTHER_INFO", "OTHER_ADDRESS", "TOPICAL"}
+CONNECTION_TYPES_TO_SKIP_HOURS = {
+    "ESERVICE_LINK",
+    "HIGHLIGHT",
+    "LINK",
+    "OTHER_ADDRESS",
+    "SOCIAL_MEDIA_LINK",
+    "TOPICAL",
+    "PRICE",
+}
 
 # here we list the tprek resource types that always have common hours and may be
 # merged if the strings are identical
@@ -60,24 +77,29 @@ class TPRekImporter(Importer):
             "https://asiointi.hel.fi/tprperhe/TPR/UI/ServicePoint/ServicePointEdit/"
         )
         self.CITIZEN_URL_BASE = "https://palvelukartta.hel.fi/fi/unit/"
-        ds_args = dict(id="tprek")
-        defaults = dict(name="Toimipisterekisteri")
         self.data_source, _ = DataSource.objects.get_or_create(
-            defaults=defaults, **ds_args
+            id="tprek",
+            defaults={"name": "Toimipisterekisteri"},
         )
-        ds_args = dict(id="kirkanta")
-        defaults = dict(name="kirjastot.fi")
         self.kirjastot_data_source, _ = DataSource.objects.get_or_create(
-            defaults=defaults, **ds_args
+            id="kirkanta",
+            defaults={"name": "kirjastot.fi"},
         )
 
         self.ignore_hours_list = set()
-        with open("hours/importer/tprek_ignore_hours_list.csv") as ignore_file:
-            csv_reader = csv.reader(ignore_file, delimiter=";")
-            # do not read the first line
-            next(csv_reader)
-            for row in csv_reader:
-                self.ignore_hours_list.add(row[0])
+
+        ignore_file_name = (
+            Path(__file__).parent.absolute() / "tprek_ignore_hours_list.csv"
+        )
+        try:
+            with open(ignore_file_name) as ignore_file:
+                csv_reader = csv.reader(ignore_file, delimiter=";")
+                # do not read the first line
+                next(csv_reader)
+                for row in csv_reader:
+                    self.ignore_hours_list.add(row[0])
+        except OSError:
+            self.logger.warning('Ignore file "tprek_ignore_hours_list.csv" not found.')
 
         # this maps the imported resource names to Hauki objects
         self.data_to_match = {
@@ -459,7 +481,7 @@ class TPRekImporter(Importer):
                 )
         return periods
 
-    def parse_opening_string(self, string: str) -> list:
+    def parse_opening_string(self, opening_string: str) -> list:
         """
         Takes TPREK simple Finnish opening hours string for a single period
         and returns corresponding opening time spans, if found.
@@ -491,7 +513,7 @@ class TPRekImporter(Importer):
         # 2) standardize dashes
         # 3) get rid of common typos:
         #   - "klo.", "klo:", "kl." -> "klo "
-        string = " " + " ".join(string.split()).replace("−", "-")
+        string = " " + " ".join(opening_string.split()).replace("−", "-")
         string = (
             string.replace("klo.", "klo").replace("klo:", "klo").replace("kl.", "klo")
         )
@@ -913,13 +935,16 @@ class TPRekImporter(Importer):
         # connections
         data.pop("connection_id", None)
         data.pop("unit_id", None)
+        resource_type = CONNECTION_TYPE_MAPPING.get(
+            data["section_type"], ResourceType.SUBSECTION
+        )
         connection_data = {
             "origins": [origin],
-            "resource_type": CONNECTION_TYPE_MAPPING[data["section_type"]],
+            "resource_type": resource_type,
             "name": name,
             "description": description,
             "address": self.get_resource_name(data)
-            if CONNECTION_TYPE_MAPPING[data["section_type"]] == ResourceType.ENTRANCE
+            if resource_type == ResourceType.ENTRANCE
             else "",
             "parents": parents,
             "extra_data": data,
@@ -932,11 +957,17 @@ class TPRekImporter(Importer):
         """
         Takes connection data list and filters the connections that should be imported.
         """
-        return [
-            connection
-            for connection in data
-            if connection["section_type"] not in CONNECTION_TYPES_TO_IGNORE
-        ]
+
+        def should_import_connection(connection):
+            if connection["section_type"] in CONNECTION_TYPES_TO_IGNORE:
+                return False
+
+            if connection["connection_id"].startswith("miscinfo-"):
+                return False
+
+            return True
+
+        return list(filter(should_import_connection, data))
 
     def get_opening_hours_data(self, data: dict, allow_missing_resource=False) -> list:
         """
@@ -979,9 +1010,17 @@ class TPRekImporter(Importer):
 
         data = []
         for period in periods:
-            parsed_time_spans, names, descriptions = self.parse_opening_string(
-                period["string"]
-            )
+            try:
+                parsed_time_spans, names, descriptions = self.parse_opening_string(
+                    period["string"]
+                )
+            except ValueError as e:
+                self.logger.warning(
+                    'Value error "{}" when parsing'
+                    ' period string "{}". Skipping period.'.format(e, period_string)
+                )
+                continue
+
             # Time spans may be grouped if several different services are found!
             # In this case, each additional group will give rise to an additional
             # period in an additional subsection, even though only one period string
@@ -1131,16 +1170,31 @@ class TPRekImporter(Importer):
         We only wish to import opening hours, and only for objects that have no openings
         from other sources.
         """
-        libraries = Resource.objects.filter(
+        library_ids = Resource.objects.filter(
             origins__data_source=self.kirjastot_data_source
-        )
-        return [
-            connection
-            for connection in data
-            if connection["section_type"] == "OPENING_HOURS"
-            and self.resource_cache.get(str(connection["unit_id"]), None)
-            not in libraries
-        ]
+        ).values_list("id", flat=True)
+
+        def should_import_opening_hours(connection):
+            if connection["section_type"] != "OPENING_HOURS":
+                return False
+
+            # Don't import opening hours for a resource that doesn't exist
+            # or is a library.
+            resource = self.resource_cache.get(str(connection["unit_id"]), None)
+            if not resource or resource.id in library_ids:
+                return False
+
+            # Don't import opening hours for resources that get opening hours from
+            # somewhere else than TPR.
+            resource_data_sources = {
+                origin.data_source_id for origin in resource.origins.all()
+            }
+            if resource_data_sources.intersection({"visithelsinki", "kaupunkialusta"}):
+                return False
+
+            return True
+
+        return list(filter(should_import_opening_hours, data))
 
     @db.transaction.atomic
     def import_objects(
@@ -1369,14 +1423,16 @@ class TPRekImporter(Importer):
     @db.transaction.atomic
     def import_units(self):
         self.logger.info("Importing TPREK units")
-        self.import_objects("unit")
+        with DeferUpdatingDenormalizedDatePeriodData():
+            self.import_objects("unit")
 
     @db.transaction.atomic
     def import_connections(self):
         self.logger.info("Importing TPREK connections")
         if self.options.get("merge", None):
             self.logger.info("Merging mergeable connections")
-        self.import_objects("connection")
+        with DeferUpdatingDenormalizedDatePeriodData():
+            self.import_objects("connection")
 
     def import_resources(self):
         self.import_units()
@@ -1384,4 +1440,5 @@ class TPRekImporter(Importer):
 
     def import_openings(self):
         self.logger.info("Importing TPREK opening hours")
-        self.import_objects("opening_hours")
+        with DeferUpdatingDenormalizedDatePeriodData():
+            self.import_objects("opening_hours")

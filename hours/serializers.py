@@ -213,9 +213,15 @@ class ResourceSerializer(
             "extra_data",
             "is_public",
             "timezone",
+            "date_periods_hash",
+            "date_periods_as_text",
         ]
 
-        read_only_fields = ["last_modified_by"]
+        read_only_fields = [
+            "last_modified_by",
+            "date_periods_hash",
+            "date_periods_as_text",
+        ]
         extra_kwargs = {"parents": {"required": False}, "origins": {"required": False}}
 
     def _prefetch_related_instances(self, field, related_data):

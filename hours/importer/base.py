@@ -25,7 +25,7 @@ class Importer(object):
         for obj in (
             Resource.objects.filter(origins__data_source=self.data_source)
             .distinct()
-            .prefetch_related("origins")
+            .prefetch_related("origins", "origins__data_source")
         ):
             # merged resources may exist in the database. store the same object in
             # the cache with all its origin ids.
@@ -53,16 +53,17 @@ class Importer(object):
             self.get_object_ids(obj)[0]: obj
             for obj in DatePeriod.objects.filter(
                 origins__data_source=self.data_source
-            ).prefetch_related("origins")
+            ).prefetch_related("origins", "origins__data_source")
         }
 
     def get_object_ids(self, obj: Model) -> list:
         return [
             origin.origin_id
-            for origin in obj.origins.filter(data_source=self.data_source)
+            for origin in obj.origins.all()
+            if origin.data_source_id == self.data_source.id
         ]
 
-    def get_data_ids(self, data: dict) -> str:
+    def get_data_ids(self, data: dict) -> list:
         return [
             str(origin["origin_id"])
             for origin in data["origins"]
@@ -219,7 +220,13 @@ class Importer(object):
         # object_origins = set(
         #    klass.origins.field.model.objects.filter(**{klass.origins.field.name: obj})
         # )
-        object_origins = set(obj.origins.all())
+        # Ignore kaupunkialusta origins from TPR
+        object_origins = {
+            origin
+            for origin in obj.origins.all()
+            if origin.data_source_id != "kaupunkialusta"
+        }
+
         # TODO: get_or_create makes the importer not thread-safe,
         # one importer will create an object and another will re-use it
         data_origins = set(
@@ -257,7 +264,10 @@ class Importer(object):
                     # TODO: deleted origin_ids may, however, still refer to objects that
                     # will be imported later, and may have
                     # hours that need to be taken into account.
-                    del cache[origin.origin_id]
+                    try:
+                        del cache[origin.origin_id]
+                    except KeyError:
+                        pass
                     origin.delete()
             except klass.origins.field.model.DoesNotExist:
                 # another object deleted the origin already
