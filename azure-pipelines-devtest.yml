@@ -27,10 +27,10 @@ pool: Default
 resources:
   repositories:
   # Azure DevOps repository
-  - repository: build-test-pipelines
+  - repository: build-once-pipelines
     type: git
     # project/repository
-    name: build-test/build-test-pipelines
+    name: build-once/build-once-pipelines
 
 extends:
-  template: azure-pipelines-build-test-devtest.yml@build-test-pipelines
+  template: azure-pipelines-build-once-automation-test-devtest.yml@build-once-pipelines
