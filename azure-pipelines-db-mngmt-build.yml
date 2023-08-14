@@ -27,10 +27,10 @@ pool: Default
 resources:
   repositories:
   # Azure DevOps repository
-  - repository:  db-management-django-test-pipelines
+  - repository: db-management-django-test-pipelines
     type: git
     # project/repository
-    name:  db-management-django-test/ db-management-django-test-pipelines
+    name: db-management-django-test/db-management-django-test-pipelines
 
 extends:
-  template: azure-pipelines-build-db-management-python-test.yml@ db-management-django-test-pipelines
+  template: azure-pipelines-build-db-management-python-test.yml@db-management-django-test-pipelines
